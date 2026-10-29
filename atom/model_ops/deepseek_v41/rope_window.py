@@ -251,4 +251,12 @@ def rope_quant_window(
         EMIT_PACKED=values is not None,
         EMIT_QUERY_FP8=query_fp8 is not None,
         WRITE_RING=ring is not None,
+        # One head_dim=512 row per program; the only cross-lane reduction
+        # is an order-free amax, so num_warps is bit-exact. Its effect is
+        # purely occupancy and flips with grid size (measured true GPU
+        # self-time): large prefill grids pack denser on one 32-lane
+        # wavefront (num_warps=1 is 1.3-1.8x faster); small decode grids
+        # (<~128 tokens) are latency-bound and want the default 4 warps
+        # (~1.1-1.2x faster/call). Crossover ~128-256 tokens.
+        num_warps=1 if tokens >= 256 else 4,
     )
