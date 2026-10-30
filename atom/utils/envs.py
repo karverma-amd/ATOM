@@ -939,6 +939,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
         os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
     ),
+    "ATOM_DSPARK_DRAFT_LM_HEAD_QUANT": lambda: os.getenv(
+        "ATOM_DSPARK_DRAFT_LM_HEAD_QUANT", ""
+    ).lower(),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts

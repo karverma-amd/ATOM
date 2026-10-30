@@ -10,6 +10,8 @@ from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
+from atom.model_ops.blockscale import quantize_fp8, _units
+from atom.model_ops.blockscale_kernels.fp8 import gemm_fp8_local
 from torch import nn
 
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
@@ -234,6 +236,11 @@ def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
     return torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)
 
 
+def _log_draft_logits_shape(m: int, n: int, k: int) -> None:
+    from aiter import logger as _alog
+    _alog.info(f"[draft-lm-head] logits GEMM M={m} N={n} K={k}")
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -252,6 +259,49 @@ class ParallelLMHead(VocabParallelEmbedding):
         else:
             self.register_parameter("bias", None)
 
+    def _draft_fp8_active(self) -> bool:
+        """FP8 head only on DSpark draft passes, gated by env; never the target."""
+        if not envs.ATOM_DSPARK_DRAFT_LM_HEAD_QUANT or is_plugin_mode():
+            return False
+        return get_forward_context().context.is_draft
+
+    def _fp8_logits_weight(self, weight: torch.Tensor):
+        """Cache an E4M3 + E8M0(1x32) copy of the (sharded) head weight,
+        keyed by storage so a DP shard view caches once."""
+        cache = self.__dict__.setdefault("_fp8_wcache", {})
+        key = (weight.data_ptr(), tuple(weight.shape))
+        hit = cache.get(key)
+        if hit is None:
+            hit = quantize_fp8(weight.contiguous())  # (E4M3, E8M0 1x32)
+            cache[key] = hit
+        return hit
+
+    def _logits_gemm(self, x: torch.Tensor, weight: torch.Tensor, bias):
+        """bf16 ``tgemm.mm`` by default; native microscaled-FP8 (E4M3 act x
+        E4M3 weight, E8M0 group32 scales via ``tl.dot_scaled``) for DSpark
+        draft passes. Bypasses aiter's gfx950-only FP8 dispatch via
+        ``gemm_fp8_local`` so it runs on gfx1250. Head is shared
+        target<->draft, so gated at call time on ``is_draft``. Bias-free
+        heads only (V4.1 ParallelHead has none)."""
+        if bias is None and self._draft_fp8_active():
+            mode = envs.ATOM_DSPARK_DRAFT_LM_HEAD_QUANT
+            if mode == "fp8":
+                wq, ws = self._fp8_logits_weight(weight)
+                xf = x.reshape(-1, x.shape[-1]).contiguous()
+                xq, xs = quantize_fp8(xf)
+                out = gemm_fp8_local(
+                    xq, wq, xs, ws, dtype=x.dtype,
+                    weight_group_rows=1, split_k=None,
+                    cu_num=_units(x.device.index),
+                )
+                return out.reshape(*x.shape[:-1], weight.shape[0])
+            if mode == "log":
+                xf = x.reshape(-1, x.shape[-1])
+                _log_draft_logits_shape(
+                    int(xf.shape[0]), int(weight.shape[0]), int(xf.shape[1])
+                )
+        return tgemm.mm(x, weight, bias)
+
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
             forward_context: ForwardContext = get_forward_context()
@@ -263,7 +313,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
-        logits = tgemm.mm(x, self.weight, self.bias)
+        logits = self._logits_gemm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
@@ -321,7 +371,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
-        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
+        logits = self._logits_gemm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             # `output_idx=out` rather than a returned tensor: a draft pass is
             # recorded, and a capture bakes the address the answer lands at.
@@ -424,7 +474,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             if self.bias is None
             else self.bias[dp_rank * vshard : (dp_rank + 1) * vshard]
         )
-        logits_shard = tgemm.mm(gathered, w, b)  # [dp_size * max_rows, V/dp]
+        logits_shard = self._logits_gemm(gathered, w, b)  # [dp_size * max_rows, V/dp]
         start = dp_rank * max_rows
 
         if mode == "argmax":
