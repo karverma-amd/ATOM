@@ -939,6 +939,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
         os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
     ),
+    # DSpark drafter LM-head precision: "" (bf16, default) or "fp8". When
+    # "fp8", draft passes project base logits through a private group32 FP8
+    # copy of the shared head (target still verifies in bf16). Halves the
+    # vocab-projection weight traffic on the 5-spec draft path.
+    "ATOM_DSPARK_DRAFT_LM_HEAD_QUANT": lambda: os.getenv(
+        "ATOM_DSPARK_DRAFT_LM_HEAD_QUANT", ""
+    ).lower(),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
