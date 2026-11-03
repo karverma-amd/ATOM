@@ -4114,5 +4114,13 @@ def _serve(args) -> None:
     )
 
 
+# hyi 1102: env-gated request-stage tracer (diag only)
+if os.environ.get("HYI_TRACE_DIR"):
+    import hyi_trace as _hyi_trace
+    import sys as _hyi_sys
+
+    _hyi_trace.install(_hyi_sys.modules[__name__])
+
+
 if __name__ == "__main__":
     main()

@@ -116,6 +116,7 @@ def _libc():
     libc = ctypes.CDLL(None, use_errno=True)
     libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     libc.mlock2.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
     return libc
@@ -911,7 +912,10 @@ def _fault_and_lock(lo: int, hi: int, populate: bool) -> None:
     per process and the range is still faulted in.
     """
     if _libc().mlock2(lo, hi - lo, _MLOCK_ONFAULT) != 0:
-        _warn_unlocked(ctypes.get_errno(), hi - lo)
+        # Keep the image's opt-in plain-mlock fallback without bypassing the
+        # current registration lease / munlock lifecycle.
+        if os.environ.get("ATOM_ENGRAM_MLOCK", "0") != "1" or _libc().mlock(lo, hi - lo) != 0:
+            _warn_unlocked(ctypes.get_errno(), hi - lo)
     if populate:
         _populate(lo, hi)
 

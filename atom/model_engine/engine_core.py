@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -221,6 +222,8 @@ class EngineCore:
                 and (
                     envs.ATOM_PREFILL_DECODE_INTERVAL > 0
                     or config.prefill_admit_policy == "adaptive"
+                    or os.environ.get("ATOM_PREFILL_ADMIT", "").strip().lower()
+                    in ("adaptive", "eoq", "1")
                 )
             ):
                 self._init_prefill_delayer(config)
@@ -256,7 +259,10 @@ class EngineCore:
             or self.scheduler is None
         ):
             return
-        from atom.model_engine.prefill_delayer import PrefillDelayer
+        from atom.model_engine.prefill_delayer import (
+            PrefillDelayer,
+            admit_policy_from_env,
+        )
 
         self.scheduler.set_prefill_delayer(
             PrefillDelayer(
@@ -273,8 +279,18 @@ class EngineCore:
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
-                admit_policy=config.prefill_admit_policy,
+                admit_policy=(
+                    config.prefill_admit_policy
+                    if config.prefill_admit_policy == "adaptive"
+                    else admit_policy_from_env() or config.prefill_admit_policy
+                ),
             )
+        )
+        # test-only hook (robustness of ATOM_PREFILL_ADMIT=adaptive): extra host
+        # time after every prefill step, on every DP rank of that step
+        self._test_prefill_extra_s = (
+            float(os.environ.get("ATOM_PREFILL_ADMIT_TEST_PREFILL_EXTRA_MS", "0") or 0)
+            / 1000.0
         )
 
     def _freeze_after_startup(self):
@@ -617,6 +633,11 @@ class EngineCore:
                 self.scheduler.prefill_delayer.notify_prefill_executed(
                     scheduled_batch.total_tokens_num_prefill
                 )
+            if getattr(self, "_test_prefill_extra_s", 0) > 0 and (
+                scheduled_batch.total_seqs_num_prefill > 0
+                or self.scheduler.dummy_prefill
+            ):
+                time.sleep(self._test_prefill_extra_s)
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         kv_progress = self._poll_kv_transfer_progress()
