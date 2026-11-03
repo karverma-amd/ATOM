@@ -191,6 +191,11 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+# --api-server-count > 1. In a front-end worker: the hub's admin Unix socket,
+# where everything but the inference routes is answered. In the hub: the
+# FrontendHub that feeds the workers' requests to the engine.
+_frontend_hub_uds: str | None = None
+_frontend_hub = None
 # `SYNTHETIC_TOKEN_TEXT` while a run's own text is meaningless, None otherwise.
 # One switch for both delivery modes: they decode in different places, and a
 # response that read differently depending on `stream` is the asymmetry the
@@ -1576,7 +1581,10 @@ async def lifespan(app: FastAPI):
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
-    await _refresh_metrics_once()
+    # A front-end worker holds no engine metrics: the hub answers /metrics.
+    refresh_metrics = _frontend_hub_uds is None
+    if refresh_metrics:
+        await _refresh_metrics_once()
     # The engine was built in `main()`, so this is the last point before the
     # first request at which everything reachable is still startup state.
     freeze_gc_heap("api_server")
@@ -1588,6 +1596,7 @@ async def lifespan(app: FastAPI):
             (metrics_interval, _refresh_metrics_once),
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
         )
+        if refresh_metrics or step is not _refresh_metrics_once
     ]
     try:
         yield
@@ -1614,6 +1623,55 @@ app.add_middleware(
     observe_ttft=_request_metrics.observe_time_to_first_token,
 )
 app.add_middleware(TraceMiddleware, model=lambda: model_name)
+
+# Answered by a front-end worker itself; any other path is the hub's.
+_FRONTEND_LOCAL_PATHS = frozenset(
+    (
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/responses",
+        "/v1/models",
+    )
+)
+_frontend_hub_client = None
+
+
+@app.middleware("http")
+async def _forward_to_frontend_hub(request: Request, call_next):
+    """In a front-end worker, relay management requests (health, metrics,
+    profiling, cache and debug endpoints) to the hub, which owns the engine."""
+    global _frontend_hub_client
+    if _frontend_hub_uds is None or request.url.path in _FRONTEND_LOCAL_PATHS:
+        return await call_next(request)
+    import httpx
+
+    if _frontend_hub_client is None:
+        _frontend_hub_client = httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=_frontend_hub_uds),
+            base_url="http://hub",
+            timeout=None,
+        )
+    reply = await _frontend_hub_client.request(
+        request.method,
+        request.url.path,
+        params=request.query_params,
+        content=await request.body(),
+        headers={
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in ("host", "content-length")
+        },
+    )
+    return Response(
+        content=reply.content,
+        status_code=reply.status_code,
+        headers={
+            k: v
+            for k, v in reply.headers.items()
+            if k.lower() not in ("content-length", "transfer-encoding")
+        },
+    )
 
 
 # ---- Error handlers ----
@@ -1736,13 +1794,31 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt_or_tokens = apply_chat_template(
-                tokenizer,
-                custom_message_encoder,
-                messages,
-                tools=request.tools,
-                **merged_kwargs,
-            )
+            if (
+                os.environ.get("ATOM_HYI_TPL_EXECUTOR") == "1"
+            ):  # hyi 1102 A/B: template off the event loop
+                import contextvars as _hyi_cv, functools as _hyi_ft
+
+                prompt_or_tokens = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    _hyi_cv.copy_context().run,
+                    _hyi_ft.partial(
+                        apply_chat_template,
+                        tokenizer,
+                        custom_message_encoder,
+                        messages,
+                        tools=request.tools,
+                        **merged_kwargs,
+                    ),
+                )
+            else:
+                prompt_or_tokens = apply_chat_template(
+                    tokenizer,
+                    custom_message_encoder,
+                    messages,
+                    tools=request.tools,
+                    **merged_kwargs,
+                )
 
         # The K3 template may open the reasoning channel in text or token IDs.
         _reasoning = reasoning_channel(
@@ -2798,7 +2874,10 @@ async def reset_prefix_cache():
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Prefix reset failed; some ranks may already be cleared")
-        raise HTTPException(status_code=500, detail="Prefix reset failed; some ranks may already be cleared") from exc
+        raise HTTPException(
+            status_code=500,
+            detail="Prefix reset failed; some ranks may already be cleared",
+        ) from exc
 
 
 @app.get("/debug/cache_stats")
@@ -3007,13 +3086,71 @@ def main():
         ),
     )
     parser.add_argument(
+        "--api-server-count",
+        type=int,
+        default=1,
+        help=(
+            "Front-end processes serving the HTTP port. Each one reads, parses, "
+            "templates, tokenizes and streams its own requests; the process "
+            "that owns the engine keeps routing and answers management "
+            "endpoints. Raise it when one process's event loop cannot keep up "
+            "with the request rate (long agentic conversations at high "
+            "concurrency). 1 serves everything in one process."
+        ),
+    )
+    parser.add_argument(
         "--request-log",
         type=str,
         default=None,
         help="Path to JSONL file for logging all API requests and responses (debug)",
     )
     args = parser.parse_args()
+    if args.api_server_count < 1:
+        parser.error("--api-server-count must be at least 1")
 
+    _setup_frontend(args)
+
+    logger.info(f"Initializing engine with model {args.model}...")
+    engine_args = EngineArgs.from_cli_args(args)
+    # Remote DP nodes block inside engine startup and never run the API loop.
+    # Expose their local mmap metrics on the same configured HTTP port.
+    dp_rank = (
+        envs.ATOM_DP_RANK
+        if envs.is_set("ATOM_DP_RANK")
+        else engine_args.data_parallel_rank
+    )
+    if dp_rank > 0:
+        from atom.metrics.prometheus import start_metrics_server
+
+        server, _ = start_metrics_server(args.host, args.server_port)
+        try:
+            engine_args.create_engine(tokenizer=tokenizer)
+        finally:
+            server.shutdown()
+            server.server_close()
+        return
+    _setup_reasoning_and_tools(args)
+
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+    _setup_stream_dispatch(args)
+
+    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
+    # their chunks into a thread-local; the engine core manager's output thread
+    # calls this flush after each step's callbacks to drain the buffer into the
+    # per-request stream collectors (one call_soon_threadsafe per event loop).
+    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
+    # cycle; the core manager leaves the hook as None until this resolves it.
+    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
+    if args.api_server_count > 1:
+        _start_frontend_workers(args)
+    _serve(args)
+
+
+def _setup_frontend(args) -> None:
+    """Request log, tokenizer, chat template and model name: everything a
+    front end needs before the engine exists (shared with front-end workers)."""
+    global tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global custom_message_encoder
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
@@ -3041,25 +3178,12 @@ def main():
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
-    logger.info(f"Initializing engine with model {args.model}...")
-    engine_args = EngineArgs.from_cli_args(args)
-    # Remote DP nodes block inside engine startup and never run the API loop.
-    # Expose their local mmap metrics on the same configured HTTP port.
-    dp_rank = (
-        envs.ATOM_DP_RANK
-        if envs.is_set("ATOM_DP_RANK")
-        else engine_args.data_parallel_rank
-    )
-    if dp_rank > 0:
-        from atom.metrics.prometheus import start_metrics_server
 
-        server, _ = start_metrics_server(args.host, args.server_port)
-        try:
-            engine_args.create_engine(tokenizer=tokenizer)
-        finally:
-            server.shutdown()
-            server.server_close()
-        return
+def _setup_reasoning_and_tools(args) -> None:
+    """Reasoning dialect, reasoning switch and tool-call parser, read from the
+    chat template (shared with front-end workers)."""
+    global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
+    global reasoning_dialect
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
     reasoning_dialect, _dialect_stated = resolve_dialect(
         _template_source,
@@ -3095,7 +3219,11 @@ def main():
         model=args.model,
     )
 
-    engine = engine_args.create_engine(tokenizer=tokenizer)
+
+def _setup_stream_dispatch(args) -> None:
+    """The batched stream dispatcher and detokenizer reuse (shared with
+    front-end workers)."""
+    global synthetic_token_text, _stream_batch_dispatcher
     # Forced acceptance emits draft tokens that nothing verified, and once the
     # context is long enough those degenerate into the dialect's own channel
     # framing and nothing else -- read as structure, correctly, that leaves a
@@ -3131,14 +3259,93 @@ def main():
         envs.ATOM_DETOKENIZER_AUDIT_EVERY,
     )
 
-    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
-    # their chunks into a thread-local; the engine core manager's output thread
-    # calls this flush after each step's callbacks to drain the buffer into the
-    # per-request stream collectors (one call_soon_threadsafe per event loop).
-    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
-    # cycle; the core manager leaves the hook as None until this resolves it.
-    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
 
+def _start_frontend_workers(args) -> None:
+    """--api-server-count > 1: start the hub and spawn the front-end workers,
+    which take over the public port. This process then serves management
+    endpoints only, on the hub's Unix socket."""
+    global _frontend_hub
+    import multiprocessing
+
+    from .frontend_workers import FrontendHub
+
+    hub = FrontendHub(engine.core_mgr, args.api_server_count)
+    hub.start()
+    _frontend_hub = hub
+    serve_flush = engine.core_mgr._flush_stream_batch_fn
+
+    def flush_both():
+        serve_flush()
+        hub.flush()
+
+    engine.core_mgr._flush_stream_batch_fn = flush_both
+    ctx = multiprocessing.get_context("spawn")
+    for index in range(args.api_server_count):
+        proc = ctx.Process(
+            target=_frontend_worker_main,
+            args=(args, engine.config, hub.connection_info(index), os.getpid()),
+            name=f"ATOM-APIServer-{index}",
+            daemon=True,
+        )
+        proc.start()
+    logger.info(
+        "Started %d front-end workers on %s:%s; engine hub admin socket %s",
+        args.api_server_count,
+        args.host,
+        args.server_port,
+        hub.admin_uds,
+    )
+
+
+def _frontend_worker_main(args, config, info, parent_pid) -> None:
+    """Entry point of one front-end worker process."""
+    global engine, _frontend_hub_uds
+    from .frontend_workers import (
+        FrontendEngine,
+        bind_shared_listener,
+        watch_parent,
+    )
+
+    watch_parent(parent_pid)
+    _frontend_hub_uds = info["admin_uds"]
+    _setup_frontend(args)
+    _setup_reasoning_and_tools(args)
+    engine = FrontendEngine(config, tokenizer, info)
+    _setup_stream_dispatch(args)
+    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
+    listener = bind_shared_listener(args.host, args.server_port)
+    config = uvicorn.Config(
+        app,
+        loop=_loop_impl(),
+        access_log=not args.disable_uvicorn_access_log,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
+    logger.info(
+        "Front-end worker %d serving %s:%s",
+        info["index"],
+        args.host,
+        args.server_port,
+    )
+    uvicorn.Server(config).run(sockets=[listener])
+
+
+def _loop_impl() -> str:
+    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
+    # which is markedly faster at the SSE socket I/O (sock.send / selector
+    # register-unregister) that saturates the event loop under high streaming
+    # concurrency. Fall back to the default loop if uvloop is unavailable.
+    try:
+        import uvloop  # noqa: F401
+
+        return "uvloop"
+    except ImportError:
+        logger.warning(
+            "uvloop not installed; falling back to the default asyncio loop."
+        )
+        return "auto"
+
+
+def _serve(args) -> None:
     import signal
 
     def _sigint_handler(signum, frame):
@@ -3160,20 +3367,19 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
-    # which is markedly faster at the SSE socket I/O (sock.send / selector
-    # register-unregister) that saturates the event loop under high streaming
-    # concurrency. Fall back to the default loop if uvloop is unavailable.
-    try:
-        import uvloop  # noqa: F401
-
-        loop_impl = "uvloop"
-    except ImportError:
-        loop_impl = "auto"
-        logger.warning(
-            "uvloop not installed; falling back to the default asyncio loop."
+    loop_impl = _loop_impl()
+    if _frontend_hub is not None:
+        # The workers own the public port; this process answers the
+        # management endpoints they relay.
+        logger.info(f"Engine hub serving on {_frontend_hub.admin_uds}")
+        uvicorn.run(
+            app,
+            uds=_frontend_hub.admin_uds,
+            loop=loop_impl,
+            access_log=not args.disable_uvicorn_access_log,
+            timeout_keep_alive=args.timeout_keep_alive,
         )
-
+        return
     logger.info(
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
@@ -3185,6 +3391,14 @@ def main():
         access_log=not args.disable_uvicorn_access_log,
         timeout_keep_alive=args.timeout_keep_alive,
     )
+
+
+# hyi 1102: env-gated request-stage tracer (diag only)
+if os.environ.get("HYI_TRACE_DIR"):
+    import hyi_trace as _hyi_trace
+    import sys as _hyi_sys
+
+    _hyi_trace.install(_hyi_sys.modules[__name__])
 
 
 if __name__ == "__main__":
