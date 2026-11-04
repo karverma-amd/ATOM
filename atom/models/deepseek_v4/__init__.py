@@ -164,8 +164,6 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # Env-gated quant round-trips. Read once at module load — checking each
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
-# Fused-kernel switches. Default off; flip via env to A/B against the eager path.
-_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
@@ -2720,6 +2718,13 @@ class DeepseekV4Attention(nn.Module):
         )
 
 
+# `fused_clamp_act_mul` scale layout per w2 kind: a native MX w2 (V4.1, 32x32
+# weights) reads a row-major 1x32 E8M0 x_scale, a blockscale w2 an FP32 1x128
+# one, transposed.
+_FUSED_SCALE_NATIVE_MX = {"quant_block_size": 32, "scale_dtype_fmt": "ue8m0"}
+_FUSED_SCALE_BLOCKSCALE = {"transpose_scale": True}
+
+
 class Expert(nn.Module):
     """Single MoE expert: SwiGLU FFN (w1, w2, w3). Computation in float32 for stability.
 
@@ -2757,10 +2762,19 @@ class Expert(nn.Module):
             prefix=f"{prefix}.w2",
         )
         self.swiglu_limit = swiglu_limit
-        # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
-        # quant through a single aiter triton kernel. The fused kernel emits
-        # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
+        # ATOM_V4_USE_TRITON_FUSION: clamp + silu(gate)*up [+ weights] + FP8
+        # quant in one aiter triton kernel, and w2 takes its `x_scale` instead
+        # of quantizing itself. The kernel quantizes whole scale groups of this
+        # rank's intermediate width: 32 columns for a native MX w2 (V4.1-Flash's
+        # 2304 at any TP up to 8: 576 at TP4, 288 at TP8), 128 for a blockscale
+        # one. Other widths keep the unfused path.
+        inter_per_rank = self.w2.input_size
+        group = 32 if self.w2.native_a8_group_rows is not None else 128
+        self.use_fused_clamp_act_mul = (
+            envs.ATOM_V4_USE_TRITON_FUSION
+            and inter_per_rank >= group
+            and inter_per_rank % group == 0
+        )
 
     def forward(
         self,
@@ -2775,14 +2789,17 @@ class Expert(nn.Module):
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
+            native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
                 swiglu_limit=self.swiglu_limit,
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                transpose_scale=True,
+                **(_FUSED_SCALE_NATIVE_MX if native_mx else _FUSED_SCALE_BLOCKSCALE),
             )
+            if native_mx:
+                x_scale = x_scale.view(torch.float8_e8m0fnu)
             return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
