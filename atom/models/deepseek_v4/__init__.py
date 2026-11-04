@@ -2769,6 +2769,7 @@ class Expert(nn.Module):
         # rank's intermediate width: 32 columns for a native MX w2 (V4.1-Flash's
         # 2304 at any TP up to 8: 576 at TP4, 288 at TP8), 128 for a blockscale
         # one. Other widths keep the unfused path.
+        self.quantized_input = None
         inter_per_rank = self.w2.input_size
         group = 32 if self.w2.native_a8_group_rows is not None else 128
         self.use_fused_clamp_act_mul = (
@@ -2788,7 +2789,13 @@ class Expert(nn.Module):
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        # `quantized_input`: x's MXFP8 rows and scales, set by the caller for this
+        # one call (V4.1's FFN seam quantizes them with its norm).
+        quantized, self.quantized_input = self.quantized_input, None
+        if quantized is not None and quantized[0].shape[0] == x.shape[0]:
+            combined = self.gate_up_proj(quantized[0], x_scale=quantized[1])
+        else:
+            combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
