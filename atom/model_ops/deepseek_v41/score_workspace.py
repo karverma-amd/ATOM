@@ -87,6 +87,21 @@ class PackedRows(NamedTuple):
     bands: tuple[tuple[int, int], ...]
 
 
+def _lane_max_elems():
+    """aiter's lane-maxima sizing where this chip's OPUS scorer writes them,
+    else None. Imported on use: a non-GPU install has no `aiter.jit`, and an
+    older aiter's scorer writes no lane maxima (the scorer and top-k are then
+    called as before)."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+            mqa_logits_mxfp4_lane_max_elems,
+        )
+    except ImportError:
+        return None
+    return mqa_logits_mxfp4_lane_max_elems if get_gfx() == "gfx1250" else None
+
+
 class ScoreWorkspace(LogitsWorkspace):
     """The scorer's logits plane (`LogitsWorkspace`) and each ratio's tile
     table, at their largest, and the row starts of one-row sequences. The FP4 plane has no tile tables:
@@ -152,6 +167,19 @@ class ScoreWorkspace(LogitsWorkspace):
             if self.packed
             else None
         )
+        # The packed logits' lane maxima, which gfx1250's OPUS scorer writes
+        # beside them for the top-k of the same band (`packed_lane_max`).
+        # Allocated here with the rest, so the memory profile counts them.
+        lane_max_elems = _lane_max_elems() if self.packed else None
+        self._lane_max = (
+            torch.empty(
+                lane_max_elems(self.capacity, max_tokens),
+                dtype=torch.float32,
+                device=device,
+            )
+            if lane_max_elems is not None
+            else None
+        )
         self._row_starts = torch.arange(
             max_tokens + 1, dtype=torch.int32, device=device
         )
@@ -212,6 +240,11 @@ class ScoreWorkspace(LogitsWorkspace):
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
         return self._maxima
+
+    def packed_lane_max(self):
+        """The packed logits' lane maxima (``mqa_logits_mxfp4(lane_max=...)``),
+        flat, or None where the scorer writes none."""
+        return self._lane_max
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
