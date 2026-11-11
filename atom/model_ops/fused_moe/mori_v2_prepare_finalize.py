@@ -19,9 +19,10 @@ topk_ids carry only routed expert ids and mori routes them cleanly.
 """
 
 import contextlib
+import inspect
 import logging
 import os
-from functools import lru_cache
+from functools import cache, lru_cache
 from types import SimpleNamespace
 from typing import Any
 
@@ -639,6 +640,15 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
 
+@cache
+def _mega_takes_shared_add(mega_cls) -> bool:
+    try:
+        params = inspect.signature(mega_cls.forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "shared_add" in params and "shared_ready" in params
+
+
 class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     """Modular kernel for the v2 path.
 
@@ -778,6 +788,10 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         self._assert_recipe_matches(mega, kwargs)
 
         ids = topk_ids.to(torch.int32).contiguous()
+        pending = (kwargs.get("moe_extra_args") or {}).get("shared_add")
+        shared_kw = {}
+        if pending is not None and _mega_takes_shared_add(type(mega)):
+            shared_kw = {"shared_add": pending.tensor, "shared_ready": pending.ready}
         out = mega(
             hidden_states.contiguous(),
             topk_weights.to(torch.float32).contiguous(),
@@ -794,7 +808,10 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
             combine_wire=self.prepare_finalize.combine_wire_for_step(),
+            **shared_kw,
         )
+        if shared_kw:
+            pending.consumed = True
         return out
 
     @staticmethod
