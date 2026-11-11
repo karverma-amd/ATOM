@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: MIT
+"""Self-consistency of the vocab-split probabilistic verification.
+
+prob_rejection_sample splits each row's statistics, top-p search and residual
+draw into vocab chunks, can fall back to the per-row top-p search when the
+cutoff interval stays wide, and can read the target rows of the full logits
+in place (`logit_rows=`). Each variant must give the same tokens and verdict
+as the plain path on the same inputs:
+
+- `logit_rows=` against the compacted target rows;
+- several vocab chunks against a single chunk (cross-chunk combine);
+- the per-row top-p fallback against the split top-p search.
+
+Needs a GPU, or TRITON_INTERPRET=1 (then runs on the CPU).
+"""
+
+import os
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("triton")
+if torch.cuda.is_available():
+    DEV = "cuda"
+elif os.environ.get("TRITON_INTERPRET") == "1":
+    DEV = "cpu"
+else:
+    pytest.skip("needs a GPU or TRITON_INTERPRET=1", allow_module_level=True)
+
+import atom.model_ops.dspark_prob_sample as dps
+
+# Three vocab chunks, the last one partial.
+V = 2 * dps._CHUNK + 3616
+R, N = 4, 3
+PER_ROW_TOP_P = (0.95, 0.5, 1.0, 0.8)
+
+
+def _case(seed, greedy_rows=(), no_q_rows=()):
+    g = torch.Generator().manual_seed(seed)
+    temps = torch.full((R,), 0.8)
+    for i in greedy_rows:
+        temps[i] = 1e-10
+    per = N + 1
+    full = torch.randn(R * per + 3, V, generator=g) * 3.0
+    full[1] *= 0.05  # a flat row: top-p keeps many tokens
+    drafts = torch.randint(0, V, (R, N), generator=g, dtype=torch.int32)
+    q = torch.randn(R, N, V, generator=g) * 3.0
+    for i in range(R):
+        for k in range(0, N, 2):  # some drafts likely under both models
+            full[i * per + k, drafts[i, k]] += 12.0
+            q[i, k, drafts[i, k]] += 12.0
+    input_ids = torch.zeros(R * per, dtype=torch.int32)
+    rows = torch.zeros(R * N, dtype=torch.int32)
+    bonus_rows = torch.zeros(R, dtype=torch.int32)
+    for i in range(R):
+        input_ids[i * per + 1 : (i + 1) * per] = drafts[i]
+        rows[i * N : (i + 1) * N] = torch.arange(N, dtype=torch.int32) + i * per
+        bonus_rows[i] = i * per + N
+    src = torch.arange(R, dtype=torch.int32)
+    src[list(no_q_rows)] = -1
+    to = {"device": DEV}
+    return {
+        "full": full.to(**to),
+        "rows": rows.to(**to),
+        "input_ids": input_ids.to(**to),
+        "cu": (torch.arange(1, R + 1, dtype=torch.int32) * N).to(**to),
+        "bonus": torch.randint(0, V, (R,), generator=g, dtype=torch.int32).to(**to),
+        "bonus_rows": bonus_rows.to(**to),
+        "temps": temps.to(**to),
+        "src": src.to(**to),
+        "q": q.to(**to),
+        "drafts": drafts.to(**to),
+    }
+
+
+def _verify(c, top_p, use_block, in_place=False):
+    state = dps.ProbDraftState(
+        q=c["q"].clone(),
+        ids=c["drafts"].clone(),
+        temps=c["temps"].clone(),
+        seed=torch.zeros(1, dtype=torch.int64, device=DEV),
+    )
+    state.set_layout(0, V, 1)
+    state.verify_step = 12345
+    if torch.is_tensor(top_p):
+        top_p = top_p.to(DEV)
+    logits = c["full"] if in_place else c["full"].index_select(0, c["rows"])
+    out, verdict = dps.prob_rejection_sample(
+        c["input_ids"],
+        c["rows"],
+        N,
+        c["cu"],
+        logits,
+        c["bonus"],
+        c["bonus_rows"],
+        c["temps"],
+        top_p,
+        c["src"],
+        state,
+        use_block=use_block,
+        logit_rows=c["rows"] if in_place else None,
+    )
+    return out.cpu(), verdict.cpu()
+
+
+CASES = [
+    # seed, top_p, block verification, greedy rows, rows without q
+    (1, None, False, (), ()),
+    (2, 0.9, False, (), ()),
+    (3, 0.9, True, (2,), (1,)),
+    (4, None, True, (), (3,)),
+    (5, torch.tensor(PER_ROW_TOP_P), False, (0,), ()),
+    (6, torch.tensor(PER_ROW_TOP_P), True, (), (2,)),
+]
+
+
+def _assert_same(a, b):
+    assert torch.equal(a[0], b[0]), (a[0], b[0])
+    assert torch.equal(a[1], b[1]), (a[1], b[1])
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES)
+def test_rows_read_in_place_match_compacted_rows(seed, top_p, use_block, greedy, no_q):
+    c = _case(seed, greedy, no_q)
+    _assert_same(
+        _verify(c, top_p, use_block, in_place=True), _verify(c, top_p, use_block)
+    )
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES)
+def test_vocab_chunks_match_a_single_chunk(
+    monkeypatch, seed, top_p, use_block, greedy, no_q
+):
+    c = _case(seed, greedy, no_q)
+    split = _verify(c, top_p, use_block)
+    assert triton_cdiv(V, dps._CHUNK) > 2
+    monkeypatch.setattr(dps, "_CHUNK", 4 * dps._CHUNK)  # one chunk per row
+    _assert_same(split, _verify(c, top_p, use_block))
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES[1:3] + CASES[4:])
+def test_per_row_top_p_fallback_matches_split_search(
+    monkeypatch, seed, top_p, use_block, greedy, no_q
+):
+    c = _case(seed, greedy, no_q)
+    split = _verify(c, top_p, use_block)
+    # A tiny compaction buffer: every top-p row overflows its final interval
+    # and takes the per-row search instead.
+    monkeypatch.setattr(dps, "_TOPP_RB", 16)
+    _assert_same(split, _verify(c, top_p, use_block))
+
+
+def triton_cdiv(a, b):
+    return -(-a // b)

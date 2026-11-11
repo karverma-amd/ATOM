@@ -3648,7 +3648,14 @@ class ModelRunner:
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
+            # The probability-ratio verification reads the target rows of
+            # `logits` in place (`prob_rejection_sample(logit_rows=)`); the
+            # compacted copy is made only for a reader that needs it.
+            target_logits = (
+                None
+                if batch.required_channel is None and not all_greedy
+                else torch.index_select(logits, 0, target_logits_indices)
+            )
             channel = self._constrain_required_channel(
                 batch, bonus_logits, spec_decode_metadata, target_logits
             )
@@ -3665,6 +3672,13 @@ class ModelRunner:
             prob_src = None
             if not all_greedy and prob_state is not None:
                 prob_src = prob_state.src_for(batch.req_ids, bs)
+            # Every other reader (the existing rejection sampler, the
+            # verification sampler, the acceptance diagnostics) takes the
+            # compacted target rows.
+            if target_logits is None and (
+                prob_src is None or envs.ATOM_DSPARK_PROB_DEBUG
+            ):
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
             if not all_greedy and ratio is None and prob_src is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
@@ -3719,12 +3733,13 @@ class ModelRunner:
                     prob_rejection_sample,
                 )
 
+                in_place = target_logits is None
                 sampled_tokens, verdict = prob_rejection_sample(
                     spec_decode_metadata.input_ids,
                     spec_decode_metadata.target_logits_indices,
                     spec_decode_metadata.num_spec_steps,
                     spec_decode_metadata.cu_num_draft_tokens,
-                    target_logits,
+                    logits if in_place else target_logits,
                     bonus_token_ids,
                     spec_decode_metadata.bonus_logits_indices,
                     temperatures,
@@ -3735,6 +3750,7 @@ class ModelRunner:
                     tp_group=get_tp_group(),
                     use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
                     bonus_ready=bonus_ready,
+                    logit_rows=target_logits_indices if in_place else None,
                 )
                 if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
                     debug_acceptance(
