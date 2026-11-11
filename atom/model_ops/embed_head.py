@@ -354,14 +354,20 @@ class ParallelLMHead(VocabParallelEmbedding):
         return out.copy_(token)
 
     def _vocab_shard_logits(
-        self, x: torch.Tensor, rank: int, world: int
+        self,
+        x: torch.Tensor,
+        rank: int,
+        world: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``x``'s logits over the ``rank``-th of ``world`` equal vocab slices of
-        a replicated head."""
+        a replicated head, written into ``out`` when given."""
         vshard = self.num_embeddings // world
         vocab = slice(rank * vshard, (rank + 1) * vshard)
         bias = None if self.bias is None else self.bias[vocab]
-        return tgemm.mm(x, self.weight[vocab], bias)
+        if out is None:
+            return tgemm.mm(x, self.weight[vocab], bias)
+        return tgemm.mm(x, self.weight[vocab], bias, out=out)
 
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
         """Every Ulysses SP rank (TP1) holds the same rows here: project them
@@ -516,9 +522,28 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
         gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
+        start = dp_rank * max_rows
+        peer = self.__dict__.get("_dp_logits_exchange")
+        if mode == "allgather" and peer is not None and max_rows <= peer.max_rows:
+            if not self.__dict__.get("_dp_logits_peer_logged", False):
+                logger.info(
+                    "DP logits peer exchange active: rank=%d padded_rows=%d local_rows=%d",
+                    dp_rank,
+                    max_rows,
+                    local_rows,
+                )
+                self._dp_logits_peer_logged = True
+            # The GEMM writes this rank's shard straight into the peer pool.
+            return peer.produce(
+                lambda dst: self._vocab_shard_logits(
+                    gathered, dp_rank, dp_size, out=dst
+                ),
+                max_rows,
+                local_rows,
+            )
+
         # [dp_size * max_rows, V/dp]
         logits_shard = self._vocab_shard_logits(gathered, dp_rank, dp_size)
-        start = dp_rank * max_rows
 
         if mode == "argmax":
             # Reduce each shard to (max, global_id); exchange only [Σrows, 2].

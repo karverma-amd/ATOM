@@ -9,15 +9,7 @@ import triton
 import triton.language as tl
 from aiter.dist.device_communicators.vmm_allocator import VMMBuffer, vmm_exchange
 
-
-@triton.jit
-def _stage(Input, Peers, Rank: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr):
-    target = tl.multiple_of(tl.load(Peers + Rank), 16).to(
-        tl.pointer_type(Input.dtype.element_ty)
-    )
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    values = tl.load(Input + offsets, offsets < N, other=0)
-    tl.store(target + offsets, values, offsets < N)
+from atom.mono.runtime.uncached import DeviceBytes
 
 
 @triton.jit
@@ -105,6 +97,12 @@ class PeerLogitsExchange:
         if len(pointers) != 4 or not all(pointers):
             raise RuntimeError("Every peer must map the logits pool")
         self.peers = torch.tensor(pointers, dtype=torch.int64, device=self.device)
+        # This rank's own slot in the pool as a tensor, so a producer can write
+        # its logits there directly instead of staging a copy.
+        self.local = torch.as_tensor(
+            DeviceBytes(self.buffer.data_ptr, 4 * max_rows * vocab_shard * width),
+            device=self.device,
+        ).view(dtype)
         self.token = torch.zeros(4, dtype=torch.float32, device=self.device)
         self.barrier_output = torch.empty_like(self.token)
         torch.cuda.synchronize()
@@ -122,6 +120,8 @@ class PeerLogitsExchange:
             dist.all_reduce(self.token, group=self.barrier_group)
 
     def __call__(self, x, local_rows):
+        """``produce`` from logits already computed: ``x`` is this rank's
+        ``[4 * rows, vocab]`` shard, copied into its slot of the pool."""
         if (
             x.ndim != 2
             or x.shape[0] % 4
@@ -130,41 +130,35 @@ class PeerLogitsExchange:
             or x.dtype != self.dtype
         ):
             raise ValueError("Input does not match the peer pool geometry")
-        rows = x.shape[0] // 4
+        return self.produce(lambda dst: dst.copy_(x), x.shape[0] // 4, local_rows)
+
+    def produce(self, fill, rows, local_rows):
+        """Exchange this rank's ``[4 * rows, vocab]`` logits, which
+        ``fill(dst)`` writes straight into its slot of the pool: this rank's
+        ``[local_rows, 4 * vocab]`` rows over the whole vocab."""
         if rows > self.max_rows or not 0 <= local_rows <= rows:
             raise ValueError("Input rows exceed the peer pool capacity")
-        x = x.contiguous()
         output = torch.empty(
-            (local_rows, 4 * self.vocab), device=x.device, dtype=x.dtype
-        )
-        # Copy raw 64-bit words. An integer pointer obtained from the peer table
-        # can lose alignment metadata in lowering; word-sized transport avoids
-        # scalar 16-bit XGMI transactions without changing any logits bits.
-        words = x.view(torch.int64)
-        output_words = output.view(torch.int64)
-        vocab_words = self.vocab // 4
-        self._barrier()
-        _stage[(triton.cdiv(words.numel(), 8192),)](
-            words,
-            self.peers,
-            self.rank,
-            words.numel(),
-            8192,
-            num_warps=8,
+            (local_rows, 4 * self.vocab), device=self.device, dtype=self.dtype
         )
         self._barrier()
+        fill(self.local[: 4 * rows * self.vocab].view(4 * rows, self.vocab))
+        self._barrier()
+        self._gather_rows(output, rows, local_rows)
+        return output
+
+    def _gather_rows(self, output, rows, local_rows):
         if local_rows:
-            _gather[(triton.cdiv(local_rows * vocab_words, 4096), 4)](
+            _gather[(triton.cdiv(local_rows * (self.vocab // 4), 4096), 4)](
                 self.peers,
-                output_words,
+                output.view(torch.int64),
                 self.rank,
                 rows,
                 local_rows,
-                vocab_words,
+                self.vocab // 4,
                 4096,
                 num_warps=4,
             )
-        return output
 
     def close(self):
         torch.cuda.synchronize()
