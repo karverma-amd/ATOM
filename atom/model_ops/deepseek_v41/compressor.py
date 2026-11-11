@@ -18,15 +18,28 @@ class CompressorTail:
     scores: torch.Tensor
 
 
-def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scatter):
+def compress_batch(
+    cache, owner, compressor, values, scores, step, rope, *, scatter, update_state=True
+):
     """Every compression boundary in the batch, through V4's fused kernel.
 
     `scatter` supplies the BF16 pages and block tables, or is None for
     separate value/scale planes. Those planes quantize the kernel's rotated
     BF16 echo so they retain the same rounding as the BF16 cache.
 
-    Returns `(latent, rotated)`: the pre-RoPE index-key source and the
-    optional post-RoPE echo. Both are None when the plan has no rows.
+    `scatter` is the `(pages, block_tables)` the kernel writes the rotated
+    latent into, or `None` for a pool whose layout it cannot write -- the
+    packed one interleaves FP4 with its scales, so the caller gets the rotated
+    value echoed back and packs it itself. Rotating a second time in torch
+    would round differently, and the FP4 grid turns that into level flips.
+
+    Returns `(latent, rotated)`: the post-norm PRE-RoPE latent the index key
+    projects from, and the echo when asked. Both `None` when no request
+    crossed a boundary.
+
+    `update_state=False` leaves the compressor ring to the caller, which then
+    owes `update_compressor_states` after this returns (a quantized pool folds
+    it into the launch that writes the echo).
     """
     ratio = compressor.ratio
     plan = step.plans[ratio]
@@ -84,21 +97,23 @@ def compress_batch(cache, owner, compressor, values, scores, step, rope, *, scat
         )
     if ring_in_launch:
         return latent.unsqueeze(0), None if rotated is None else rotated.unsqueeze(0)
-    # Unconditional -- a forward crossing no boundary still owes the ring its
-    # projections, or the round that does cross one reads a position nobody
-    # wrote.
-    update_compressor_states(
-        values[0],
-        gate[0],
-        compressor.ape,
-        kv_state,
-        score_state,
-        write_plan=plan.write_plan_gpu,
-        state_slot_mapping=step.slots,
-        ratio=ratio,
-        overlap=False,
-        prefix=f"csa2.compress_state_{owner}",
-    )
+    # After the boundary kernel, never before: that reads the ring as of the
+    # previous forward, this overwrites it for the next. Unconditional -- a
+    # forward crossing no boundary still owes the ring its projections, or the
+    # round that does cross one reads a position nobody wrote.
+    if update_state:
+        update_compressor_states(
+            values[0],
+            gate[0],
+            compressor.ape,
+            kv_state,
+            score_state,
+            write_plan=plan.write_plan_gpu,
+            state_slot_mapping=step.slots,
+            ratio=ratio,
+            overlap=False,
+            prefix=f"csa2.compress_state_{owner}",
+        )
     if latent is None:
         return None, None
     return latent.unsqueeze(0), None if rotated is None else rotated.unsqueeze(0)
