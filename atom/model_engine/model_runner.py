@@ -606,6 +606,41 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
 
+        if getattr(batch, "is_mixed", False):
+            # Mixed [decode | prefill], decode-first. The scheduler laid the
+            # whole window as decode anchors (the carried-over decodes' last
+            # committed token, a placeholder) followed by the prefill prompts.
+            # Stage it all, then overwrite the decode region with the previous
+            # forward's sampled ids wherever a decode was deferred to the GPU
+            # (exactly the pure-decode deferred path, scoped to the decode
+            # sub-batch and its [0:nd] slots). The decode `cu_seqlens_q` is the
+            # merged layout's first `bs+1` entries ([0,1,...,nd]); `width` is the
+            # decode token count so the fill never zeroes the prefill tail.
+            total = total_tokens_decode + total_tokens_prefill
+            self.input_ids.np[:total] = scheduled_tokens[:total]
+            bs, _lens, _cu = self.runner.attn_metadata_builder.decode_spans(batch)
+            src_np = self.decode_src.np[:bs]
+            src_np.fill(NEW_SEQUENCE)
+            locs = None
+            if self.prev_batch is not None:
+                locs = self.get_token_locations(batch.mixed_decode_batch)
+                src_np[locs.deferred_curr] = locs.deferred_prev
+            publication_group.set_counts(
+                {"input_ids": total, "decode_src": bs, "batch_info": 3}
+            )
+            publication_group.publish()
+            if self.prev_batch is not None:
+                fill_deferred_decode_ids(
+                    self.input_ids.gpu,
+                    self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
+                    self.decode_src.gpu[:bs],
+                    self.prev_token_ids,
+                    None,
+                    max_tokens_per_seq=1,
+                    width=total_tokens_decode,
+                )
+            return self.input_ids.gpu[:total], None
+
         # TODO: remove this when we support mixed prefill and decode in one batch
         if batch.has_prefill:
             # Decode does not publish an empty prefill prefix: an explicit
@@ -2815,6 +2850,106 @@ class ModelRunner:
             and batch.total_seqs_num_decode > 0
         )
 
+    def _build_mixed_metadata(self, batch, forward_mode, input_ids):
+        """Build decode + prefill attention metadata for a mixed step and merge.
+
+        Returns ``(merged_md, positions, decode_md, prefill_md)``. The merged
+        metadata is the prefill metadata (so the LM head's `cu_seqlens_q` is the
+        prefill segment's) with a concatenated `slot_mapping`; the per-segment
+        metadata is carried on the Context for the MLA two-pass. positions are
+        `cat(decode_positions, prefill_positions)` in row order.
+        """
+        decode_sub = batch.mixed_decode_batch
+        prefill_sub = batch.mixed_prefill_batch
+        nd_seqs = decode_sub.total_seqs_num
+        nd_tokens = decode_sub.total_tokens_num
+        np_seqs = prefill_sub.total_seqs_num
+        np_tokens = prefill_sub.total_tokens_num
+        total_tokens = nd_tokens + np_tokens
+
+        # Decode segment first: one query row per seq (DSR-1 has no spec). This
+        # build stages into the shared `forward_vars` host/GPU buffers
+        # ("positions", "slot_mapping", "cu_seqlens_q", "block_tables", ...).
+        decode_md, decode_pos = self.attn_metadata_builder.build(
+            batch=decode_sub,
+            running_bs=nd_seqs,
+            running_tokens=nd_tokens,
+            max_seqlen_q=1,
+            is_prefill=False,
+        )
+        # Detach the decode segment from the shared buffers before the prefill
+        # build reuses them. The publish copied host->device on this compute
+        # stream with non_blocking=True, so clones enqueued now are correctly
+        # stream-ordered after it.
+        decode_md = self._clone_attn_metadata(decode_md)
+        decode_pos = decode_pos.clone()
+
+        # Open a second publication phase for the prefill build. finish() seals
+        # the decode publications (recording the completion event over their
+        # host reads) and begin() synchronizes it (so the decode H2D copies have
+        # finished reading the shared host buffers before the prefill build
+        # rewrites them) and bumps the epoch (so re-publishing the shared
+        # metadata buffers is legitimate rather than a duplicate-publish). The
+        # decode clones above were enqueued on the compute stream before this,
+        # so they read the decode GPU buffers before the prefill build reuses
+        # them.
+        self.h2d_owner.finish()
+        self.h2d_owner.begin()
+
+        # Re-lay the query-side metadata (`cu_seqlens_q`, `batch_id_per_q_token`)
+        # for the prefill segment at row 0. `prepare_model` laid it once over the
+        # whole merged batch, so index 0 currently holds the decode rows; the
+        # prefill build's `stage_prefill` reads `cu_seqlens_q` from index 0 and
+        # asserts it ends at the prefill tokens.
+        self.attn_metadata_builder.publish_query_metadata(
+            self.attn_metadata_builder.query_lengths(prefill_sub, True, np_tokens),
+            np_seqs,
+            np_tokens,
+        )
+
+        # Prefill segment: ragged, its own scheduled tokens. Reuses the shared
+        # buffers (now that the decode segment owns independent copies).
+        prefill_md, prefill_pos = self.attn_metadata_builder.build(
+            batch=prefill_sub,
+            running_bs=np_seqs,
+            running_tokens=np_tokens,
+            max_seqlen_q=forward_mode.max_seqlen_q,
+            is_prefill=True,
+        )
+
+        # Lay the step's positions out in [decode | prefill] row order in the
+        # model-input buffer the model reads via `_padded_inputs`.
+        merged_pos = torch.cat([decode_pos, prefill_pos], dim=-1)
+        pos_buf = self.forward_vars["positions"]
+        pos_buf.gpu[:total_tokens].copy_(merged_pos)
+        positions = pos_buf.gpu[:total_tokens]
+
+        # Merged metadata for the non-attention consumers (LM head gather is
+        # special-cased in embed_head). Keep the prefill metadata and splice a
+        # merged slot_mapping so any cache-write path over the full batch is
+        # addressed correctly.
+        merged_md = prefill_md
+        if decode_md.slot_mapping is not None and prefill_md.slot_mapping is not None:
+            merged_md.slot_mapping = torch.cat(
+                [decode_md.slot_mapping.flatten(), prefill_md.slot_mapping.flatten()]
+            )
+        self.attn_metadata_builder.prepare_model_inputs(input_ids, merged_md)
+        return merged_md, positions, decode_md, prefill_md
+
+    @staticmethod
+    def _clone_attn_metadata(md):
+        """Return a copy of ``md`` with every tensor field cloned, so a later
+        build reusing the shared `forward_vars` buffers cannot clobber it."""
+        import copy
+        import dataclasses
+
+        clone = copy.copy(md)
+        for f in dataclasses.fields(clone):
+            v = getattr(clone, f.name)
+            if isinstance(v, torch.Tensor):
+                setattr(clone, f.name, v.clone())
+        return clone
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
@@ -2840,19 +2975,35 @@ class ModelRunner:
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
                 input_ids, spec_decode_indices
             )
-        attn_metadata, positions = self.attn_metadata_builder.build(
-            batch=batch,
-            running_bs=running_bs,
-            running_tokens=running_tokens,
-            max_seqlen_q=forward_mode.max_seqlen_q,
-            is_prefill=is_prefill,
-            ubatch_slices=forward_mode.ubatch_slices,
-            pcp_groups=forward_mode.pcp_groups,
-        )
-        self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
+        decode_md = prefill_md = None
+        if forward_mode.is_mixed:
+            # Build per-segment metadata from the sub-batches the scheduler
+            # attached, then merge. Decode and prefill use separate h2d buffer
+            # groups ("decode_metadata" / "prefill_metadata"), so the two builds
+            # do not clobber each other. positions are concatenated in the
+            # batch's [decode | prefill] row order.
+            attn_metadata, positions, decode_md, prefill_md = (
+                self._build_mixed_metadata(batch, forward_mode, input_ids)
+            )
+        else:
+            attn_metadata, positions = self.attn_metadata_builder.build(
+                batch=batch,
+                running_bs=running_bs,
+                running_tokens=running_tokens,
+                max_seqlen_q=forward_mode.max_seqlen_q,
+                is_prefill=is_prefill,
+                ubatch_slices=forward_mode.ubatch_slices,
+                pcp_groups=forward_mode.pcp_groups,
+            )
+            self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
+            is_mixed=forward_mode.is_mixed,
+            num_decode_tokens=forward_mode.num_decode_tokens,
+            num_decode_seqs=forward_mode.num_decode_seqs,
+            mixed_decode_md=decode_md,
+            mixed_prefill_md=prefill_md,
             is_dummy_run=batch.is_dummy_run,
             scheduled_bs=forward_mode.scheduled_bs,
             scheduled_tokens=scheduled_tokens,

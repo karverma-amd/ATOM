@@ -189,6 +189,15 @@ class ForwardMode:
     # The DP group replays request graphs as one this step: a decode's whole
     # forward (`use_cudagraph`), a prefill's decoder (`DecoderGraph`).
     req_graphs: bool = False
+    # Mixed prefill/decode step: the batch carries decode rows
+    # [0:num_decode_seqs] followed by prefill rows. `is_prefill` is True on a
+    # mixed step (the prefill segment drives the ragged/eager shape handling);
+    # consumers that must tell a true all-prefill step from a mixed one read
+    # this. `num_decode_tokens`/`num_decode_seqs` are the decode segment extent,
+    # used by attention to slice the forward and by the LM head to gather rows.
+    is_mixed: bool = False
+    num_decode_tokens: int = 0
+    num_decode_seqs: int = 0
     # The step's TBO micro-batches, cut once on the settled shape
     # (`ModelRunner._cut_ubatches`): the attention backends lay each
     # micro-batch's metadata out from it and the wrapper runs it. None when
@@ -240,6 +249,12 @@ class ForwardMode:
         agrees on it.
         """
         is_prefill = batch.has_prefill
+        # A mixed batch carries BOTH decode and prefill rows. It is handled like
+        # a prefill step (ragged, eager) with a decode segment spliced in front;
+        # `is_prefill` stays True so the ragged token-count path is taken.
+        is_mixed = (
+            batch.total_seqs_num_decode > 0 and batch.total_seqs_num_prefill > 0
+        )
         scheduled_tokens = batch.total_tokens_num
         # The whole batch, never a per-kind count: `schedule` returns its
         # prefill batch before it can add a decode row, so the two are equal
@@ -329,7 +344,12 @@ class ForwardMode:
         # one -- unless it is a decode and the buckets were recorded split
         # (`tbo_decode_graphs`), where the bucket's recording is the split.
         tbo_eager = tbo_collective_active and (is_prefill or not tbo_decode_graphs)
-        graphable = not (enforce_eager or step_needs_eager or tbo_eager)
+        # A mixed step runs the compiled model without a single-forward graph
+        # replay (the validated eager-mixed path). The token-graph replay port
+        # for AiterMLA is scaffolded (build_for_token_graph_capture +
+        # supports_token_graph) but not yet enabled: its replay path still needs
+        # work, so mixed stays off the graph ladder here.
+        graphable = not (enforce_eager or step_needs_eager or tbo_eager or is_mixed)
         # A recording holds every rank's rows in its collectives, so the group
         # replays request graphs as one, on a step every rank runs alike: all
         # decoding (`unified`) or all prefilling.
@@ -380,6 +400,9 @@ class ForwardMode:
             token_graph=bool(token_graph) or (decode_recorded and graphable),
             prefill_token_graph=bool(token_graph),
             req_graphs=req_graphs,
+            is_mixed=is_mixed,
+            num_decode_tokens=batch.total_tokens_num_decode,
+            num_decode_seqs=batch.total_seqs_num_decode,
         )
 
     @staticmethod
@@ -543,6 +566,16 @@ class Context:
     # This context is used to store the basic context of the forward.
     positions: torch.Tensor
     is_prefill: bool = False
+    # Mixed prefill/decode step markers (see ForwardMode). On a mixed step the
+    # first `num_decode_tokens` rows are decode (one token per `num_decode_seqs`
+    # decode seqs, DSR-1 has no spec so tokens==seqs), the rest are prefill.
+    # The per-segment attention metadata is stored on `mixed_decode_md` /
+    # `mixed_prefill_md` so the MLA forward can dispatch each segment.
+    is_mixed: bool = False
+    num_decode_tokens: int = 0
+    num_decode_seqs: int = 0
+    mixed_decode_md: "AttentionMetaData | None" = None
+    mixed_prefill_md: "AttentionMetaData | None" = None
     is_dummy_run: bool = False
     # What this rank was handed. Duplicated from `forward_mode` because a
     # capture context has none; `scheduled_tokens` counts this rank's real rows.
@@ -614,6 +647,11 @@ class Context:
         self,
         positions: torch.Tensor,
         is_prefill: bool = False,
+        is_mixed: bool = False,
+        num_decode_tokens: int = 0,
+        num_decode_seqs: int = 0,
+        mixed_decode_md: "AttentionMetaData | None" = None,
+        mixed_prefill_md: "AttentionMetaData | None" = None,
         is_dummy_run: bool = False,
         scheduled_bs: int = 0,
         scheduled_tokens: int = 0,
@@ -633,6 +671,11 @@ class Context:
     ):
         self.positions = positions
         self.is_prefill = is_prefill
+        self.is_mixed = is_mixed
+        self.num_decode_tokens = num_decode_tokens
+        self.num_decode_seqs = num_decode_seqs
+        self.mixed_decode_md = mixed_decode_md
+        self.mixed_prefill_md = mixed_prefill_md
         self.is_dummy_run = is_dummy_run
         self.scheduled_bs = scheduled_bs
         self.scheduled_tokens = scheduled_tokens

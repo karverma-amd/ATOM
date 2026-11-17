@@ -384,6 +384,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     _indexer_fp4 = False
     mtp_keeps_selection = False
 
+    # Token-graph replay port (WIP): `build_for_token_graph_capture` below
+    # records the model's prefill token graphs successfully, but the replay path
+    # for AiterMLA still wedges (prefills emit no tokens), so it stays disabled.
+    # Flip to True (and re-enable the forward_context/scheduler/model_runner
+    # hooks) to resume the port. Leaving it False keeps the validated
+    # eager-mixed path live.
+    supports_token_graph = False
+
     def _global_num_draft_layers(self) -> int:
         """Return draft layers in the target MLA pool across all PP stages."""
         runner = self.model_runner
@@ -3495,6 +3503,71 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # A capture runs a full synthetic batch: nothing is padded.
             scheduled_tokens=scheduled_tokens,
             running_tokens=scheduled_tokens,
+        )
+        return attn_metadata, context
+
+    def build_for_token_graph_capture(self, tokens):
+        """A synthetic native prefill of ``tokens`` rows for recording the
+        model's prefill token graph at that bucket.
+
+        Requests of one KV block each (the last takes the remainder), all on
+        placeholder page 0. Native prefill attention is self-contained -- MHA
+        over the query, no KV-cache context reads -- so page 0 is harmless; the
+        regions run for real only to record the segment shapes, and
+        ``reset_cache_after_capture`` reclaims the writes afterward. Returns
+        ``(attn_metadata, context)`` like `build_for_cudagraph_capture`.
+        """
+        from types import SimpleNamespace
+
+        if not 0 < tokens <= self.max_num_batched_tokens:
+            raise ValueError("token-graph shape exceeds the token buffer")
+        w = self.model_runner.block_size
+        lengths = [w] * (tokens // w)
+        if tokens % w:
+            lengths.append(tokens % w)
+        if len(lengths) > self.max_bs:
+            # Too many requests for the query layout: one request of the bucket.
+            lengths = [tokens]
+        count = len(lengths)
+        lengths_np = np.asarray(lengths, dtype=np.int32)
+        pages = -(-int(lengths_np.max()) // self.model_runner.block_size)
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=tuple(range(count)),
+            num_scheduled_tokens=lengths_np,
+            # Native prefill: context == query, no cached prefix.
+            context_lens=lengths_np,
+            # A list, not an array: `stage_prefill` compares it with `==` to a
+            # derived list (an array would make the assert's truth ambiguous).
+            num_cached_tokens=[0] * count,
+            # Tuple-of-tuples (page 0 for every row), as a real batch holds it:
+            # `_write_prefill_slots` tests it with `if not batch.block_tables`.
+            block_tables=((0,) * pages,) * count,
+            total_seqs_num=count,
+            total_seqs_num_prefill=count,
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            is_final_chunk=None,
+            state_maintenance_ops=SimpleNamespace(
+                relocations=(), checkpoint_stores=(), checkpoint_restores=()
+            ),
+        )
+        self.publish_query_metadata(lengths_np, count, tokens)
+        attn_metadata, positions = self.build(
+            batch=batch,
+            running_bs=count,
+            running_tokens=tokens,
+            max_seqlen_q=int(lengths_np.max()),
+            is_prefill=True,
+        )
+        attn_metadata.dummy = True
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            scheduled_bs=count,
+            scheduled_tokens=tokens,
+            running_bs=count,
+            running_tokens=tokens,
         )
         return attn_metadata, context
 

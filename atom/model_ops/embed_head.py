@@ -264,12 +264,26 @@ class ParallelLMHead(VocabParallelEmbedding):
             attn_metadata = forward_context.attn_metadata
             # context = get_context()
             if context.is_prefill and not context.is_draft:
-                # The scheduled requests' last tokens only: a padding request
-                # has none.
-                bs = context.scheduled_bs
-                last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
-                # Under Ulysses SP, x is this rank's token shard.
-                x = sp_gather_rows(x, last_indices)
+                if getattr(context, "is_mixed", False):
+                    # Mixed [decode | prefill]: keep every decode row (one token
+                    # per decode seq, at positions 0..nd-1), then each prefill
+                    # seq's last token (its cu_seqlens offset by the decode
+                    # tokens in front). attn_metadata is the prefill segment's.
+                    nd = int(context.num_decode_tokens)
+                    cu = attn_metadata.cu_seqlens_q
+                    pf_last = cu[1:] - 1 + nd
+                    decode_idx = torch.arange(
+                        nd, device=pf_last.device, dtype=pf_last.dtype
+                    )
+                    last_indices = torch.cat([decode_idx, pf_last])
+                    x = sp_gather_rows(x, last_indices)
+                else:
+                    # The scheduled requests' last tokens only: a padding request
+                    # has none.
+                    bs = context.scheduled_bs
+                    last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
+                    # Under Ulysses SP, x is this rank's token shard.
+                    x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:

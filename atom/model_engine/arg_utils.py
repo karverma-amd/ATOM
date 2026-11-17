@@ -145,6 +145,8 @@ class EngineArgs:
     enable_decoder_swa_bounded_replay: bool = True
     enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
+    # Opt-in mixed prefill/decode batching (see Config.enable_mixed_prefill_decode).
+    enable_mixed_prefill_decode: bool = False
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
     sampler_independent_noise: bool = False
@@ -596,6 +598,13 @@ class EngineArgs:
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable_mixed_prefill_decode",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Enable mixed prefill/decode batching: one forward carries "
+            "decode rows then prefill rows (default: disabled).",
         )
         parser.add_argument(
             "--enable-request-context-metrics",

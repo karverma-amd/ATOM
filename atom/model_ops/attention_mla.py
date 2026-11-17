@@ -89,6 +89,7 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+from atom.utils import forward_context as _fc_module
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
@@ -3192,6 +3193,14 @@ class MLAAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
+        # Mixed prefill/decode: split the forward into a decode segment and a
+        # prefill segment, each run through this same path with its own phase
+        # and metadata, then concatenate. Reuses the existing PS1 decode and
+        # prefill kernels unchanged (see `_forward_mixed`).
+        if getattr(context, "is_mixed", False):
+            return self._forward_mixed(
+                q, k_nope, k_rope, positions, q_scale, forward_context, context
+            )
         use_prefill_mla = self.is_sparse_mla and attn_metadata.run_sparse
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
@@ -3529,6 +3538,71 @@ class MLAAttention(nn.Module):
                 )
 
         return output
+
+    def _forward_mixed(
+        self, q, k_nope, k_rope, positions, q_scale, forward_context, context
+    ):
+        """Two-pass dispatch for a mixed ``[decode | prefill]`` batch.
+
+        The first ``num_decode_tokens`` rows are decode, the rest prefill. Each
+        segment is run through ``forward_impl`` with a thread-local forward
+        context carrying that segment's phase and attention metadata (so the
+        existing per-phase kernels fire unchanged), and the outputs are
+        concatenated back into the batch's row order.
+        """
+        import copy as _copy
+
+        nd = int(context.num_decode_tokens)
+        total = q.shape[0]
+        # Decode-first row order: decode tokens occupy [0:nd], prefill the tail
+        # [nd:total]. `nd` is a multiple of 32 (clamped in the scheduler), so the
+        # block-quantized `q_scale` (one entry per 32 tokens on its leading axis)
+        # splits cleanly at `nd/32`.
+        QBLK = 32
+
+        def _slice_tok(t, start, end):
+            if t is None:
+                return None
+            if isinstance(t, torch.Tensor) and t.dim() >= 1 and t.shape[0] == total:
+                return t[start:end]
+            return t
+
+        def _slice_scale(t, blk_start, blk_end):
+            if t is None or not isinstance(t, torch.Tensor):
+                return t
+            return t[blk_start:blk_end]
+
+        def _run(start, end, is_prefill, seg_md, seg_scale):
+            sub_ctx = _copy.copy(context)
+            sub_ctx.is_mixed = False
+            sub_ctx.is_prefill = is_prefill
+            sub_ctx.num_decode_tokens = 0
+            sub_pos = _slice_tok(positions, start, end)
+            sub_ctx.positions = sub_pos
+            sub_fc = _copy.copy(forward_context)
+            sub_fc.context = sub_ctx
+            sub_fc.attn_metadata = seg_md
+            prev = getattr(_fc_module._forward_context_local, "ctx", None)
+            _fc_module._forward_context_local.ctx = sub_fc
+            try:
+                return self.forward_impl(
+                    q=_slice_tok(q, start, end),
+                    k_nope=_slice_tok(k_nope, start, end),
+                    k_rope=_slice_tok(k_rope, start, end),
+                    positions=sub_pos,
+                    q_scale=seg_scale,
+                )
+            finally:
+                _fc_module._forward_context_local.ctx = prev
+
+        nblk = nd // QBLK
+        out_decode = _run(
+            0, nd, False, context.mixed_decode_md, _slice_scale(q_scale, 0, nblk)
+        )
+        out_prefill = _run(
+            nd, total, True, context.mixed_prefill_md, _slice_scale(q_scale, nblk, None)
+        )
+        return torch.cat([out_decode, out_prefill], dim=0)
 
     def forward(
         self,

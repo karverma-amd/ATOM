@@ -2164,6 +2164,12 @@ class Config:
     index_cache_layout: str | None = field(default=None, init=False)
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    # Mixed prefill/decode batching: let a single forward carry decode rows
+    # followed by prefill rows ([decode | prefill]), so a prefill chunk does
+    # not force running decodes to wait a whole step. Opt-in and off by
+    # default; when off every path is byte-identical to the phase-exclusive
+    # scheduler. DSR-1 (DeepseekV2) offline uses this with no MTP/draft/TBO.
+    enable_mixed_prefill_decode: bool = False
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
     # --sampler-independent-noise: draw a fresh exponential noise row per

@@ -481,6 +481,13 @@ class ScheduledBatch:
         self.finished_recving_kv_req_ids: list[int] = []
 
         self.is_dummy_run = is_dummy_run
+        # Mixed prefill/decode: set by the scheduler when decode rows are
+        # spliced in front of a prefill. The sub-batches carry each segment's
+        # rows for per-segment attention-metadata builds; this (merged) batch
+        # is the one forwarded. False/None on every ordinary batch.
+        self.is_mixed = False
+        self.mixed_decode_batch = None
+        self.mixed_prefill_batch = None
         self.num_spec_step = num_spec_step
         # Set by the PP head on a batch whose completion it waits for although
         # the batch produces no output. It travels with the metadata, so the
@@ -835,6 +842,12 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        # Mixed prefill/decode batching: when a prefill step is scheduled and
+        # running decodes fit in the leftover token budget, splice them in front
+        # so one forward serves both. Off -> the phase-exclusive scheduler.
+        self.enable_mixed_prefill_decode = getattr(
+            config, "enable_mixed_prefill_decode", False
+        )
         self.dynamic_chunking_smooth_factor = config.dynamic_chunking_smooth_factor
         self.dynamic_chunking_min_chunk_size = config.dynamic_chunking_min_chunk_size
         self.enable_dynamic_chunking = config.enable_dynamic_chunking
@@ -2889,6 +2902,22 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
 
+            # Mixed prefill/decode: splice running decodes in front of this
+            # prefill when they fit the leftover token budget. Returns the
+            # merged [decode | prefill] batch, or None to keep prefill-only.
+            if self.enable_mixed_prefill_decode:
+                mixed = self._augment_with_decodes(
+                    prefill_batch,
+                    scheduled_seqs,
+                    num_scheduled_tokens,
+                    num_cached_tokens_list,
+                    is_final_chunk,
+                    total_tokens_num_prefill,
+                    num_seqs_prefill,
+                )
+                if mixed is not None:
+                    return mixed
+
             return (prefill_batch, scheduled_seqs)
 
         if group_prefill_tick:
@@ -3037,6 +3066,156 @@ class Scheduler:
         )
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
+
+    def _augment_with_decodes(
+        self,
+        prefill_batch,
+        prefill_seqs,
+        prefill_tokens_list,
+        prefill_cached_list,
+        prefill_is_final,
+        total_tokens_num_prefill,
+        num_seqs_prefill,
+    ):
+        """Splice running decodes in front of a scheduled prefill into one
+        ``[decode | prefill]`` batch (mixed prefill/decode).
+
+        Returns ``(merged_batch, merged_seqs)`` or ``None`` to keep the
+        prefill-only batch. The merged batch carries the per-segment
+        sub-batches on ``mixed_decode_batch`` / ``mixed_prefill_batch`` so the
+        model runner can build each segment's attention metadata; the merged
+        batch itself is the one forwarded. DSR-1 has no MTP/spec, so a decode
+        row is one token; the generic spec handling is retained but inert.
+        """
+        spec_width = self.mtp_k if self.use_spec else 0
+        num_new_tokens = spec_width + 1
+        budget = self.max_num_batched_tokens - total_tokens_num_prefill
+        max_decode_seqs = self.max_num_seqs - num_seqs_prefill
+        if budget < num_new_tokens or max_decode_seqs <= 0 or not self.running:
+            return None
+
+        decode_seqs: dict[int, Sequence] = {}
+        decode_tokens: list[int] = []
+        decode_cached: list[int] = []
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
+        skipped_partial_prefills: list[Sequence] = []
+        skipped_pp_inflight: list[Sequence] = []
+        _pp_block = self._pp_inflight_token_block
+        # Phase 1: collect candidate decodes (read-only `can_append`, no commit
+        # yet) bounded by the token budget and seq cap. Committing (`may_append`)
+        # is deferred to phase 2 so the 32-alignment clamp can drop the tail
+        # candidates cleanly, without having reserved KV for them.
+        candidates: list[Sequence] = []
+        cand_tokens = 0
+        while self.running and len(candidates) < max_decode_seqs:
+            if cand_tokens + num_new_tokens > budget:
+                break
+            seq = self.running.popleft()
+            if seq.is_partial_prefill or seq.id in prefill_seqs:
+                skipped_partial_prefills.append(seq)
+                continue
+            if _pp_block and seq.id in _pp_block:
+                skipped_pp_inflight.append(seq)
+                continue
+            # Conservative: only admit a decode whose next-token KV fits without
+            # preemption. Mixing must never trigger preemption churn mid-prefill.
+            if not self.block_manager.can_append(
+                seq, num_new_tokens, self.draft_lookahead
+            ):
+                self.running.appendleft(seq)
+                break
+            candidates.append(seq)
+            cand_tokens += num_new_tokens
+
+        # 32-alignment clamp: the attention two-pass splits the fp8 q latent at
+        # the decode-token boundary, and its block scale carries one entry per
+        # 32 tokens, so the decode token count must be a multiple of 32. Drop the
+        # overflow tail back to the running queue (uncommitted, so just re-queue).
+        QBLK = 32
+        kept = (cand_tokens // QBLK) * QBLK // num_new_tokens
+        dropped = candidates[kept:]
+        candidates = candidates[:kept]
+
+        # Phase 2: commit the kept candidates.
+        num_decode_tokens = 0
+        for seq in candidates:
+            if self.use_spec and seq.spec_token_ids.size > 0:
+                scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
+            self.block_manager.may_append(
+                seq, num_new_tokens, lookahead=self.draft_lookahead
+            )
+            seq.type = SequenceType.DECODE
+            seq.is_first_decode = False
+            decode_seqs[seq.id] = seq
+            decode_tokens.append(num_new_tokens)
+            decode_cached.append(seq.num_cached_tokens)
+            num_decode_tokens += num_new_tokens
+
+        # Restore the running queue: decodes back at the head in order, dropped
+        # tail candidates after them, skipped partial-prefills / PP-inflight at
+        # the tail (mirrors the decode path).
+        if decode_seqs:
+            self.running.extendleft(reversed(list(decode_seqs.values())))
+        if dropped:
+            self.running.extend(dropped)
+        if skipped_partial_prefills:
+            self.running.extend(skipped_partial_prefills)
+        if skipped_pp_inflight:
+            self.running.extend(skipped_pp_inflight)
+
+        if not decode_seqs:
+            return None
+
+        num_seqs_decode = len(decode_seqs)
+        decode_sub = ScheduledBatch(
+            seqs=decode_seqs,
+            num_scheduled_tokens=decode_tokens,
+            total_tokens_num=num_decode_tokens,
+            total_tokens_num_decode=num_decode_tokens,
+            total_seqs_num=num_seqs_decode,
+            total_seqs_num_decode=num_seqs_decode,
+            num_spec_step=spec_width,
+            is_deferred_out=self.is_deferred_out,
+            scheduled_spec_decode_tokens=dict(scheduled_spec_decode_tokens),
+        )
+        self._consume_state_forks(decode_seqs)
+
+        # Decode-first row order. The decode segment occupies rows [0:nd] and
+        # the prefill segment [nd:]. The attention two-pass splits the merged
+        # activation (fp8 q latent) at the `nd`-token boundary; its block scale
+        # has one entry per 32 tokens, so the split must be 32-aligned. The
+        # decode token count was clamped to a multiple of 32 above for exactly
+        # this reason, so `q_scale[:nd/32]` / `q_scale[nd/32:]` both land on
+        # block boundaries.
+        merged_seqs = {**decode_seqs, **prefill_seqs}
+        merged_tokens = decode_tokens + list(prefill_tokens_list)
+        merged = ScheduledBatch(
+            seqs=merged_seqs,
+            num_scheduled_tokens=merged_tokens,
+            total_tokens_num=num_decode_tokens + total_tokens_num_prefill,
+            total_tokens_num_prefill=total_tokens_num_prefill,
+            total_tokens_num_decode=num_decode_tokens,
+            total_seqs_num=num_seqs_decode + num_seqs_prefill,
+            total_seqs_num_prefill=num_seqs_prefill,
+            total_seqs_num_decode=num_seqs_decode,
+            num_cached_tokens=decode_cached + list(prefill_cached_list),
+            is_final_chunk=[False] * num_seqs_decode + list(prefill_is_final),
+            num_spec_step=spec_width,
+            is_deferred_out=self.is_deferred_out,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+        )
+        merged.is_mixed = True
+        merged.mixed_decode_batch = decode_sub
+        merged.mixed_prefill_batch = prefill_batch
+        logger.info(
+            "Scheduled MIXED batch: %d decode + %d prefill rows, "
+            "%d decode + %d prefill tokens",
+            num_seqs_decode,
+            num_seqs_prefill,
+            num_decode_tokens,
+            total_tokens_num_prefill,
+        )
+        return (merged, merged_seqs)
 
     @staticmethod
     def _consume_state_forks(scheduled_seqs: dict[int, Sequence]) -> None:
